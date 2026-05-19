@@ -83,6 +83,17 @@ async function handleAPI(request, env) {
     }
   }
 
+  // Bulk import
+  if (path === '/api/cards/bulk' && method === 'POST') {
+    const body = await request.json()
+    if (!Array.isArray(body)) return json({ error: 'expected array' }, 400)
+    const cards = await getAll(env.INVENTORY, CARDS_KEY)
+    const now = Date.now()
+    const added = body.map(b => ({ id: uid(), createdAt: now, ...b }))
+    await saveAll(env.INVENTORY, CARDS_KEY, [...cards, ...added])
+    return json({ imported: added.length }, 201)
+  }
+
   // Location view (for QR scan)
   const locViewMatch = path.match(/^\/location\/([^/]+)$/)
   if (locViewMatch && method === 'GET') {
@@ -152,6 +163,7 @@ const HTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>🃏 寶可夢卡牌庫存</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#f0f2f5;min-height:100vh}
@@ -212,6 +224,8 @@ button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:.
     <input type="text" id="search" placeholder="搜尋卡片名稱、系列..." oninput="renderCards()">
     <select id="filter-loc" onchange="renderCards()"><option value="">所有位置</option></select>
     <button class="btn-primary" onclick="openCardModal()">＋ 新增卡片</button>
+    <button class="btn-secondary" onclick="openImportModal()">📥 Excel 匯入</button>
+    <button class="btn-secondary" onclick="downloadTemplate()">📄 下載範本</button>
   </div>
   <div id="card-grid" class="card-grid"></div>
 </div>
@@ -262,6 +276,28 @@ button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:.
     <div class="modal-actions">
       <button class="btn-secondary" onclick="closeModal('loc-modal')">取消</button>
       <button class="btn-primary" onclick="saveLoc()">儲存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Import Modal -->
+<div class="modal" id="import-modal">
+  <div class="modal-box" style="max-width:600px">
+    <h2>📥 Excel 匯入</h2>
+    <p style="font-size:.85rem;color:#666;margin-bottom:12px">支援 .xlsx / .xls / .csv。欄位標題需包含：名稱（必填）、系列、編號、狀態、數量、位置、備註</p>
+    <div class="form-group">
+      <input type="file" id="import-file" accept=".xlsx,.xls,.csv" onchange="parseImportFile(this)">
+    </div>
+    <div id="import-preview" style="display:none">
+      <div style="font-size:.85rem;color:#555;margin-bottom:8px" id="import-summary"></div>
+      <div style="overflow-x:auto;max-height:220px;overflow-y:auto;border:1px solid #eee;border-radius:6px">
+        <table style="width:100%;border-collapse:collapse;font-size:.8rem" id="import-table"></table>
+      </div>
+      <div style="margin-top:8px;font-size:.8rem;color:#e63946" id="import-warn"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-secondary" onclick="closeModal('import-modal')">取消</button>
+      <button class="btn-primary" id="import-btn" onclick="doImport()" disabled>匯入</button>
     </div>
   </div>
 </div>
@@ -432,6 +468,100 @@ function closeModal(id) { document.getElementById(id).classList.remove('open') }
 
 function esc(s) {
   return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+}
+
+// --- Excel Import ---
+let importRows = []
+
+const COL_MAP = {
+  '名稱': 'name', 'name': 'name', 'card name': 'name', '卡片名稱': 'name',
+  '系列': 'set', 'set': 'set', 'series': 'set',
+  '編號': 'number', 'number': 'number', 'no': 'number', 'card no': 'number',
+  '狀態': 'condition', 'condition': 'condition', 'grade': 'condition',
+  '數量': 'quantity', 'quantity': 'quantity', 'qty': 'quantity', 'count': 'quantity',
+  '位置': 'location', 'location': 'location', 'box': 'location', '儲存位置': 'location',
+  '備註': 'notes', 'notes': 'notes', 'note': 'notes', 'remark': 'notes',
+}
+
+function openImportModal() {
+  importRows = []
+  document.getElementById('import-file').value = ''
+  document.getElementById('import-preview').style.display = 'none'
+  document.getElementById('import-btn').disabled = true
+  document.getElementById('import-modal').classList.add('open')
+}
+
+function parseImportFile(input) {
+  const file = input.files[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = e => {
+    const wb = XLSX.read(e.target.result, { type: 'array' })
+    const ws = wb.Sheets[wb.SheetNames[0]]
+    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' })
+    if (raw.length < 2) { alert('檔案沒有資料'); return }
+
+    const headers = raw[0].map(h => String(h).trim().toLowerCase())
+    const fieldMap = headers.map(h => COL_MAP[h] || null)
+    const nameIdx = fieldMap.indexOf('name')
+    if (nameIdx === -1) { alert('找不到「名稱」欄位，請確認標題列'); return }
+
+    importRows = raw.slice(1).filter(row => row[nameIdx]).map(row => {
+      const card = {}
+      fieldMap.forEach((field, i) => {
+        if (!field || field === 'location') return
+        const val = String(row[i] ?? '').trim()
+        if (val) card[field] = field === 'quantity' ? (parseInt(val) || 1) : val
+      })
+      // resolve location name → id
+      const locIdx = fieldMap.indexOf('location')
+      if (locIdx !== -1 && row[locIdx]) {
+        const locName = String(row[locIdx]).trim()
+        const found = locations.find(l => l.name.toLowerCase() === locName.toLowerCase())
+        if (found) card.locationId = found.id
+        else card._locName = locName  // unresolved — shown as warning
+      }
+      return card
+    })
+
+    const unresolved = [...new Set(importRows.filter(r => r._locName).map(r => r._locName))]
+    const warn = unresolved.length ? \`⚠️ 找不到位置：\${unresolved.join('、')}，這些卡片將設為「未指定」\` : ''
+    document.getElementById('import-warn').textContent = warn
+    document.getElementById('import-summary').textContent = \`共 \${importRows.length} 筆資料\`
+
+    // Preview table
+    const previewFields = ['name','set','number','condition','quantity','_locName']
+    const head = '<thead style="background:#f0f2f5"><tr>' + ['名稱','系列','編號','狀態','數量','位置'].map(h => \`<th style="padding:6px 10px;text-align:left">\${h}</th>\`).join('') + '</tr></thead>'
+    const body = '<tbody>' + importRows.slice(0, 8).map(r =>
+      '<tr style="border-bottom:1px solid #eee">' + previewFields.map(f => \`<td style="padding:6px 10px">\${esc(r[f] || (f==='_locName'?'':'-'))}</td>\`).join('') + '</tr>'
+    ).join('') + (importRows.length > 8 ? \`<tr><td colspan="6" style="padding:6px 10px;color:#888">…還有 \${importRows.length-8} 筆</td></tr>\` : '') + '</tbody>'
+    document.getElementById('import-table').innerHTML = head + body
+    document.getElementById('import-preview').style.display = 'block'
+    document.getElementById('import-btn').disabled = false
+  }
+  reader.readAsArrayBuffer(file)
+}
+
+async function doImport() {
+  const clean = importRows.map(({ _locName, ...r }) => r)
+  const res = await fetch('/api/cards/bulk', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(clean)
+  })
+  const data = await res.json()
+  closeModal('import-modal')
+  await load()
+  alert(\`成功匯入 \${data.imported} 張卡片！\`)
+}
+
+function downloadTemplate() {
+  const ws = XLSX.utils.aoa_to_sheet([
+    ['名稱','系列','編號','狀態','數量','位置','備註'],
+    ['皮卡丘','Base Set','58/102','Near Mint',1,'Box A-1',''],
+    ['噴火龍','Base Set','4/102','Mint',1,'Box A-1','閃卡'],
+  ])
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, 'Cards')
+  XLSX.writeFile(wb, 'pokemon-inventory-template.xlsx')
 }
 
 // Close modal on backdrop click
