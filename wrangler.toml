@@ -4,5 +4,5 @@ compatibility_date = "2024-01-01"
 
 [[kv_namespaces]]
 binding = "INVENTORY"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_KV_PREVIEW_ID"
+id = "cb80d023c7dd4011a2e09be525ea9483D"
+preview_id = "cb80d023c7dd4011a2e09be525ea9483"
